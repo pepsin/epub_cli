@@ -1,4 +1,7 @@
 const std = @import("std");
+const names = @import("names.zig");
+
+pub const injectNameTags = names.injectNameTags;
 
 const ANSI_RESET = "\x1b[0m";
 const ANSI_BOLD = "\x1b[1m";
@@ -26,6 +29,7 @@ const ANSI_BG_BLUE = "\x1b[44m";
 const ANSI_BG_MAGENTA = "\x1b[45m";
 const ANSI_BG_CYAN = "\x1b[46m";
 const ANSI_BG_WHITE = "\x1b[47m";
+const ANSI_NAME = ANSI_BOLD ++ ANSI_MAGENTA;
 
 const TagStyle = struct {
     open: []const u8,
@@ -57,6 +61,7 @@ fn getTagStyle(tag: []const u8) ?TagStyle {
 
     // Highlight search matches - special handling
     if (std.mem.eql(u8, t, "search-match")) return .{ .open = ANSI_BG_YELLOW ++ ANSI_BLACK ++ ANSI_BOLD };
+    if (std.mem.eql(u8, t, "name")) return .{ .open = ANSI_NAME };
 
     return null;
 }
