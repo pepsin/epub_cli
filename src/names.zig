@@ -520,28 +520,12 @@ const NAME_CLOSE_TAGS = [_][]const u8{
     "</name4>", "</name5>", "</name6>", "</name7>",
 };
 
-pub fn buildNameSetFromContents(allocator: std.mem.Allocator, contents: []const []const u8) !NameSet {
-    var candidates = std.StringHashMap(usize).init(allocator);
-    defer {
-        var it = candidates.keyIterator();
-        while (it.next()) |key| allocator.free(key.*);
-        candidates.deinit();
-    }
-
-    var char_freq = std.StringHashMap(usize).init(allocator);
-    defer {
-        var it = char_freq.keyIterator();
-        while (it.next()) |key| allocator.free(key.*);
-        char_freq.deinit();
-    }
-
-    for (contents) |content| {
-        if (content.len == 0) continue;
-        try countCjkChars(allocator, content, &char_freq);
-        try collectCandidates(allocator, content, &candidates);
-    }
-
-    var result = NameSet.init(allocator);
+fn addFilteredNames(
+    allocator: std.mem.Allocator,
+    candidates: *std.StringHashMap(usize),
+    char_freq: *std.StringHashMap(usize),
+    result: *NameSet,
+) !void {
     const min_count = 2;
     const jaccard_threshold: f64 = 0.10;
     const char_ratio_threshold_3: f64 = 0.20;
@@ -561,8 +545,10 @@ pub fn buildNameSetFromContents(allocator: std.mem.Allocator, contents: []const 
         const jaccard = @as(f64, @floatFromInt(count)) / @as(f64, @floatFromInt(union_size));
         if (jaccard < jaccard_threshold) continue;
 
-        const key = try allocator.dupe(u8, name);
-        try result.put(key, 0);
+        if (!result.contains(name)) {
+            const key = try allocator.dupe(u8, name);
+            try result.put(key, 0);
+        }
     }
 
     // Pass 2: 3-char names (min-character ratio filter)
@@ -572,12 +558,14 @@ pub fn buildNameSetFromContents(allocator: std.mem.Allocator, contents: []const 
         const count = entry.value_ptr.*;
         if (name.len != 9 or count < min_count) continue;
 
-        const min_freq = minCharFreq(name, &char_freq) orelse continue;
+        const min_freq = minCharFreq(name, char_freq) orelse continue;
         const char_ratio = @as(f64, @floatFromInt(count)) / @as(f64, @floatFromInt(min_freq));
         if (char_ratio < char_ratio_threshold_3) continue;
 
-        const key = try allocator.dupe(u8, name);
-        try result.put(key, 0);
+        if (!result.contains(name)) {
+            const key = try allocator.dupe(u8, name);
+            try result.put(key, 0);
+        }
     }
 
     // Pass 3: 4-char names (must have accepted 3-char prefix + min-character ratio)
@@ -590,12 +578,40 @@ pub fn buildNameSetFromContents(allocator: std.mem.Allocator, contents: []const 
         const prefix = name[0..9];
         if (!result.contains(prefix)) continue;
 
-        const min_freq = minCharFreq(name, &char_freq) orelse continue;
+        const min_freq = minCharFreq(name, char_freq) orelse continue;
         const char_ratio = @as(f64, @floatFromInt(count)) / @as(f64, @floatFromInt(min_freq));
         if (char_ratio < char_ratio_threshold_4) continue;
 
-        const key = try allocator.dupe(u8, name);
-        try result.put(key, 0);
+        if (!result.contains(name)) {
+            const key = try allocator.dupe(u8, name);
+            try result.put(key, 0);
+        }
+    }
+}
+
+pub fn buildNameSetFromContents(allocator: std.mem.Allocator, contents: []const []const u8) !NameSet {
+    var result = NameSet.init(allocator);
+
+    for (contents) |content| {
+        if (content.len == 0) continue;
+
+        var candidates = std.StringHashMap(usize).init(allocator);
+        defer {
+            var it = candidates.keyIterator();
+            while (it.next()) |key| allocator.free(key.*);
+            candidates.deinit();
+        }
+
+        var char_freq = std.StringHashMap(usize).init(allocator);
+        defer {
+            var it = char_freq.keyIterator();
+            while (it.next()) |key| allocator.free(key.*);
+            char_freq.deinit();
+        }
+
+        try countCjkChars(allocator, content, &char_freq);
+        try collectCandidates(allocator, content, &candidates);
+        try addFilteredNames(allocator, &candidates, &char_freq, &result);
     }
 
     // Assign colors (0-7) to each detected name

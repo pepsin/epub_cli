@@ -49,6 +49,12 @@ pub const Repl = struct {
         all_chapters,
     };
 
+    const PagerAction = enum {
+        quit,
+        next_chapter,
+        prev_chapter,
+    };
+
     pub fn init(allocator: std.mem.Allocator) Repl {
         return .{
             .allocator = allocator,
@@ -376,10 +382,10 @@ pub const Repl = struct {
         return width;
     }
 
-    fn runPager(self: *Repl, text: []const u8) !void {
+    fn runPager(self: *Repl, text: []const u8) !PagerAction {
         const size = term.getTerminalSize() catch {
             try stdout().print("{s}\n", .{text});
-            return;
+            return .quit;
         };
 
         var lines = std.array_list.Managed([]const u8).init(self.allocator);
@@ -389,11 +395,11 @@ pub const Repl = struct {
         while (it.next()) |line| {
             try lines.append(line);
         }
-        if (lines.items.len == 0) return;
+        if (lines.items.len == 0) return .quit;
 
         term.enableRawMode() catch {
             try stdout().print("{s}\n", .{text});
-            return;
+            return .quit;
         };
         defer term.disableRawMode();
 
@@ -415,7 +421,7 @@ pub const Repl = struct {
                 phys_rows += line_rows;
             }
 
-            try stdout().print("\x1b[7m-- {d}/{d} -- [j/k/u/d/g/G/q] --\x1b[0m", .{
+            try stdout().print("\x1b[7m-- {d}/{d} -- [j/k/↵/n/p/u/d/g/G/q] --\x1b[0m", .{
                 top + 1,
                 lines.items.len,
             });
@@ -423,8 +429,11 @@ pub const Repl = struct {
             const key = term.readKey() catch break;
             switch (key) {
                 .char => |c| switch (c) {
-                    'q', 'Q' => break,
-                    'j', 'J', '\r', '\n', ' ' => {
+                    'q', 'Q' => return .quit,
+                    'n', 'N' => return .next_chapter,
+                    'p', 'P' => return .prev_chapter,
+                    '\r', '\n' => return .next_chapter,
+                    'j', 'J', ' ' => {
                         if (top + 1 < lines.items.len) top += 1;
                     },
                     'k', 'K' => {
@@ -464,65 +473,87 @@ pub const Repl = struct {
                 .end => {
                     top = if (lines.items.len > visible_lines) lines.items.len - visible_lines else 0;
                 },
-                .escape => break,
+                .escape => return .quit,
                 else => {},
             }
         }
 
         try stdout().writeAll("\n");
+        return .quit;
     }
 
     fn showCurrentChapter(self: *Repl) !void {
-        try self.checkNameParserResult();
-        if (self.epub == null) return;
-        const e = self.epub.?;
+        while (true) {
+            try self.checkNameParserResult();
+            if (self.epub == null) return;
+            const e = self.epub.?;
 
-        if (self.current_chapter >= e.chapters.items.len) {
-            try stdout().print("\x1b[1;31mNo more chapters.\x1b[0m\n", .{});
-            return;
+            if (self.current_chapter >= e.chapters.items.len) {
+                try stdout().print("\x1b[1;31mNo more chapters.\x1b[0m\n", .{});
+                return;
+            }
+
+            const ch = e.chapters.items[self.current_chapter];
+            const raw_content = try e.getChapterContent(self.current_chapter);
+
+            if (raw_content == null) {
+                try stdout().print("\x1b[1;31mFailed to load chapter content.\x1b[0m\n", .{});
+                return;
+            }
+
+            const processed = if (self.name_highlight)
+                try html.injectNameTags(self.allocator, raw_content.?, self.name_set)
+            else
+                raw_content.?;
+            defer if (self.name_highlight) self.allocator.free(processed);
+
+            const rendered = if (self.last_search) |search_term|
+                try html.renderWithSearchHighlight(self.allocator, processed, search_term)
+            else
+                try html.renderToTerminal(self.allocator, processed);
+            defer self.allocator.free(rendered);
+
+            const header = try std.fmt.allocPrint(self.allocator,
+                "\n\x1b[1;35m╔══════════════════════════════════════════════════════════════╗\x1b[0m\n" ++
+                "\x1b[1;35m║  Chapter {d}/{d}: {s}\x1b[0m\n" ++
+                "\x1b[1;35m╚══════════════════════════════════════════════════════════════╝\x1b[0m\n\n", .{
+                self.current_chapter + 1,
+                e.chapters.items.len,
+                ch.title,
+            });
+            defer self.allocator.free(header);
+
+            const footer = try std.fmt.allocPrint(self.allocator,
+                "\n\x1b[2m── End of Chapter {d}/{d} ──\x1b[0m\n\n", .{
+                self.current_chapter + 1,
+                e.chapters.items.len,
+                });
+            defer self.allocator.free(footer);
+
+            const full_text = try std.mem.concat(self.allocator, u8, &.{ header, rendered, footer });
+            defer self.allocator.free(full_text);
+
+            const action = try self.runPager(full_text);
+            switch (action) {
+                .quit => break,
+                .next_chapter => {
+                    if (self.current_chapter + 1 >= e.chapters.items.len) {
+                        try stdout().print("\x1b[1;33mAlready at the last chapter.\x1b[0m\n", .{});
+                        break;
+                    }
+                    self.current_chapter += 1;
+                    self.saveProgress();
+                },
+                .prev_chapter => {
+                    if (self.current_chapter == 0) {
+                        try stdout().print("\x1b[1;33mAlready at the first chapter.\x1b[0m\n", .{});
+                        break;
+                    }
+                    self.current_chapter -= 1;
+                    self.saveProgress();
+                },
+            }
         }
-
-        const ch = e.chapters.items[self.current_chapter];
-        const raw_content = try e.getChapterContent(self.current_chapter);
-
-        if (raw_content == null) {
-            try stdout().print("\x1b[1;31mFailed to load chapter content.\x1b[0m\n", .{});
-            return;
-        }
-
-        const processed = if (self.name_highlight)
-            try html.injectNameTags(self.allocator, raw_content.?, self.name_set)
-        else
-            raw_content.?;
-        defer if (self.name_highlight) self.allocator.free(processed);
-
-        const rendered = if (self.last_search) |search_term|
-            try html.renderWithSearchHighlight(self.allocator, processed, search_term)
-        else
-            try html.renderToTerminal(self.allocator, processed);
-        defer self.allocator.free(rendered);
-
-        const header = try std.fmt.allocPrint(self.allocator,
-            "\n\x1b[1;35m╔══════════════════════════════════════════════════════════════╗\x1b[0m\n" ++
-            "\x1b[1;35m║  Chapter {d}/{d}: {s}\x1b[0m\n" ++
-            "\x1b[1;35m╚══════════════════════════════════════════════════════════════╝\x1b[0m\n\n", .{
-            self.current_chapter + 1,
-            e.chapters.items.len,
-            ch.title,
-        });
-        defer self.allocator.free(header);
-
-        const footer = try std.fmt.allocPrint(self.allocator,
-            "\n\x1b[2m── End of Chapter {d}/{d} ──\x1b[0m\n\n", .{
-            self.current_chapter + 1,
-            e.chapters.items.len,
-        });
-        defer self.allocator.free(footer);
-
-        const full_text = try std.mem.concat(self.allocator, u8, &.{ header, rendered, footer });
-        defer self.allocator.free(full_text);
-
-        try self.runPager(full_text);
     }
 
     fn saveProgress(self: *Repl) void {

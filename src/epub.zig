@@ -29,10 +29,12 @@ pub const Epub = struct {
         const read_len = try file.readAll(data);
         if (read_len != data.len) return error.ReadFailed;
 
+        return try loadFromBuffer(allocator, data);
+    }
+
+    pub fn loadFromBuffer(allocator: std.mem.Allocator, data: []u8) !Epub {
         var zip = try ZipReader.init(allocator, data);
         errdefer zip.deinit();
-
-
 
         var epub = Epub{
             .allocator = allocator,
