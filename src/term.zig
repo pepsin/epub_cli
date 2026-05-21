@@ -43,6 +43,7 @@ pub fn enableRawMode() !void {
     saved_termios = termios;
 
     var raw = termios;
+    raw.iflag.ICRNL = false;
     raw.lflag.ECHO = false;
     raw.lflag.ICANON = false;
     raw.lflag.ISIG = false;

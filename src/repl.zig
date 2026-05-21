@@ -197,7 +197,7 @@ pub const Repl = struct {
                     'G' => {
                         if (total > 0) selected = total - 1;
                     },
-                    '\r' => {
+                    '\r', '\n' => {
                         try stdout().writeAll("\n");
                         return selected;
                     },
@@ -266,7 +266,7 @@ pub const Repl = struct {
             switch (key) {
                 .char => |c| switch (c) {
                     'q', 'Q' => break,
-                    'j', 'J', '\r', ' ' => {
+                    'j', 'J', '\r', '\n', ' ' => {
                         if (top + 1 < lines.items.len) top += 1;
                     },
                     'k', 'K' => {
