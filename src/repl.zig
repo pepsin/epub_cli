@@ -5,6 +5,31 @@ const names = @import("names.zig");
 const term = @import("term.zig");
 const Config = @import("config.zig").Config;
 
+const NameParserCtx = struct {
+    allocator: std.mem.Allocator,
+    contents: []const []const u8,
+    mutex: std.Thread.Mutex,
+    done: bool,
+    name_set: ?names.NameSet,
+    err: ?anyerror,
+};
+
+fn nameParserThreadFn(ctx: *NameParserCtx) void {
+    const set = names.buildNameSetFromContents(ctx.allocator, ctx.contents) catch |err| {
+        ctx.mutex.lock();
+        ctx.err = err;
+        ctx.done = true;
+        ctx.mutex.unlock();
+        ctx.allocator.free(ctx.contents);
+        return;
+    };
+    ctx.mutex.lock();
+    ctx.name_set = set;
+    ctx.done = true;
+    ctx.mutex.unlock();
+    ctx.allocator.free(ctx.contents);
+}
+
 pub const Repl = struct {
     allocator: std.mem.Allocator,
     epub: ?*Epub,
@@ -16,6 +41,8 @@ pub const Repl = struct {
     name_set: ?names.NameSet,
     book_path: []const u8,
     config: ?*Config,
+    name_parser_thread: ?std.Thread,
+    name_parser_ctx: ?*NameParserCtx,
 
     const SearchMode = enum {
         current_chapter,
@@ -34,6 +61,8 @@ pub const Repl = struct {
             .name_set = null,
             .book_path = "",
             .config = null,
+            .name_parser_thread = null,
+            .name_parser_ctx = null,
         };
     }
 
@@ -42,10 +71,63 @@ pub const Repl = struct {
         if (self.name_set) |*set| {
             names.deinitNameSet(set, self.allocator);
         }
+        if (self.name_parser_thread) |thread| {
+            thread.join();
+            self.name_parser_thread = null;
+        }
+        if (self.name_parser_ctx) |ctx| {
+            if (ctx.name_set) |*set| names.deinitNameSet(set, self.allocator);
+            self.allocator.destroy(ctx);
+            self.name_parser_ctx = null;
+        }
     }
 
     fn stdout() std.fs.File.DeprecatedWriter {
         return std.fs.File.stdout().deprecatedWriter();
+    }
+
+    fn checkNameParserResult(self: *Repl) !void {
+        const ctx = self.name_parser_ctx orelse return;
+
+        ctx.mutex.lock();
+        const done = ctx.done;
+        const name_set = ctx.name_set;
+        const err = ctx.err;
+        ctx.name_set = null;
+        ctx.mutex.unlock();
+
+        if (!done) return;
+
+        if (self.name_parser_thread) |thread| {
+            thread.join();
+            self.name_parser_thread = null;
+        }
+
+        if (err) |e| {
+            try stdout().print("\x1b[1;33mName parsing failed: {s}\x1b[0m\n", .{@errorName(e)});
+        } else if (name_set) |set| {
+            self.name_set = set;
+            self.name_highlight = true;
+            self.saveProgress();
+
+            if (self.config) |cfg| {
+                var name_list = std.array_list.Managed([]const u8).init(self.allocator);
+                defer name_list.deinit();
+                var it = set.iterator();
+                while (it.next()) |entry| {
+                    try name_list.append(entry.key_ptr.*);
+                }
+                cfg.setDetectedNames(self.book_path, name_list.items) catch {};
+            }
+
+            var count: usize = 0;
+            var it = set.iterator();
+            while (it.next()) |_| count += 1;
+            try stdout().print("\x1b[1;32m✓ Name highlighting auto-enabled ({d} names detected)\x1b[0m\n", .{count});
+        }
+
+        self.allocator.destroy(ctx);
+        self.name_parser_ctx = null;
     }
 
     pub fn run(self: *Repl, epub: *Epub, book_path: []const u8, config: ?*Config) !void {
@@ -75,6 +157,36 @@ pub const Repl = struct {
             }
         }
 
+        // Start background name parser if no saved names
+        if (self.name_set == null and self.epub != null) {
+            const e = self.epub.?;
+            var contents = std.array_list.Managed([]const u8).init(self.allocator);
+            defer contents.deinit();
+            for (0..e.chapters.items.len) |i| {
+                const content = try e.getChapterContent(i);
+                try contents.append(content orelse "");
+            }
+            const contents_slice = try self.allocator.dupe([]const u8, contents.items);
+            const ctx = try self.allocator.create(NameParserCtx);
+            ctx.* = .{
+                .allocator = self.allocator,
+                .contents = contents_slice,
+                .mutex = .{},
+                .done = false,
+                .name_set = null,
+                .err = null,
+            };
+            self.name_parser_thread = std.Thread.spawn(.{}, nameParserThreadFn, .{ctx}) catch |err| blk: {
+                self.allocator.free(contents_slice);
+                self.allocator.destroy(ctx);
+                try stdout().print("\x1b[1;33mWarning: could not start name parser thread ({s})\x1b[0m\n", .{@errorName(err)});
+                break :blk null;
+            };
+            if (self.name_parser_thread != null) {
+                self.name_parser_ctx = ctx;
+            }
+        }
+
         try self.printWelcome();
         if (try self.runTocSelector()) |idx| {
             self.current_chapter = idx;
@@ -82,8 +194,11 @@ pub const Repl = struct {
             try self.showCurrentChapter();
         }
 
+        try self.checkNameParserResult();
+
         var buf: [1024]u8 = undefined;
         while (self.running) {
+            try self.checkNameParserResult();
             try self.printPrompt();
             const line = try std.fs.File.stdin().deprecatedReader().readUntilDelimiterOrEof(&buf, '\n');
             if (line == null) break;
@@ -223,6 +338,44 @@ pub const Repl = struct {
         return null;
     }
 
+    fn lineDisplayWidth(line: []const u8) usize {
+        var width: usize = 0;
+        var i: usize = 0;
+        while (i < line.len) {
+            if (line[i] == '\x1b' and i + 1 < line.len and line[i + 1] == '[') {
+                i += 2;
+                while (i < line.len and ((line[i] >= '0' and line[i] <= '9') or line[i] == ';' or line[i] == '?')) {
+                    i += 1;
+                }
+                if (i < line.len) i += 1; // skip command char
+                continue;
+            }
+            const len = std.unicode.utf8ByteSequenceLength(line[i]) catch {
+                i += 1;
+                width += 1;
+                continue;
+            };
+            if (i + len > line.len) {
+                i += 1;
+                width += 1;
+                continue;
+            }
+            const cp = std.unicode.utf8Decode(line[i..][0..len]) catch {
+                i += 1;
+                width += 1;
+                continue;
+            };
+            const is_wide = (cp >= 0x4E00 and cp <= 0x9FFF) or
+                            (cp >= 0x3400 and cp <= 0x4DBF) or
+                            (cp >= 0x3000 and cp <= 0x303F) or
+                            (cp >= 0xFF01 and cp <= 0xFF60) or
+                            (cp >= 0xFFE0 and cp <= 0xFFE6);
+            width += if (is_wide) 2 else 1;
+            i += len;
+        }
+        return width;
+    }
+
     fn runPager(self: *Repl, text: []const u8) !void {
         const size = term.getTerminalSize() catch {
             try stdout().print("{s}\n", .{text});
@@ -249,12 +402,17 @@ pub const Repl = struct {
         while (true) {
             const current_size = term.getTerminalSize() catch size;
             const visible_lines = if (current_size.rows > 1) current_size.rows - 1 else current_size.rows;
+            const cols = if (current_size.cols > 0) current_size.cols else 80;
 
             try stdout().writeAll("\x1b[2J\x1b[H");
 
-            const end = @min(top + visible_lines, lines.items.len);
-            for (lines.items[top..end]) |line| {
+            var phys_rows: usize = 0;
+            for (lines.items[top..]) |line| {
+                const w = lineDisplayWidth(line);
+                const line_rows = if (w == 0) 1 else (w + cols - 1) / cols;
+                if (phys_rows + line_rows > visible_lines) break;
                 try stdout().print("{s}\n", .{line});
+                phys_rows += line_rows;
             }
 
             try stdout().print("\x1b[7m-- {d}/{d} -- [j/k/u/d/g/G/q] --\x1b[0m", .{
@@ -315,6 +473,7 @@ pub const Repl = struct {
     }
 
     fn showCurrentChapter(self: *Repl) !void {
+        try self.checkNameParserResult();
         if (self.epub == null) return;
         const e = self.epub.?;
 
@@ -554,27 +713,39 @@ pub const Repl = struct {
         } else if (std.mem.eql(u8, cmd, "clear") or std.mem.eql(u8, cmd, "cls")) {
             try stdout().writeAll("\x1b[2J\x1b[H");
         } else if (std.mem.eql(u8, cmd, "names")) {
-            if (self.name_set == null and self.epub != null) {
-                try stdout().print("\x1b[2mScanning book for recurring names...\x1b[0m\n", .{});
-                self.name_set = try names.buildNameSet(self.allocator, self.epub.?);
-                try stdout().print("\x1b[2mDone.\x1b[0m\n", .{});
+            if (self.name_highlight) {
+                // Turning OFF is always allowed
+                self.name_highlight = false;
+                self.saveProgress();
+                try stdout().print("Name highlighting: \x1b[1;31moff\x1b[0m\n", .{});
+            } else {
+                // Trying to turn ON
+                if (self.name_set == null and self.epub != null) {
+                    if (self.name_parser_ctx != null) {
+                        try stdout().print("\x1b[1;33mName detection still in progress, please wait...\x1b[0m\n", .{});
+                    } else {
+                        try stdout().print("\x1b[2mScanning book for recurring names...\x1b[0m\n", .{});
+                        self.name_set = try names.buildNameSet(self.allocator, self.epub.?);
+                        try stdout().print("\x1b[2mDone.\x1b[0m\n", .{});
 
-                // Save detected names to config
-                if (self.config) |cfg| {
-                    var name_list = std.array_list.Managed([]const u8).init(self.allocator);
-                    defer name_list.deinit();
-                    var it = self.name_set.?.iterator();
-                    while (it.next()) |entry| {
-                        try name_list.append(entry.key_ptr.*);
+                        if (self.config) |cfg| {
+                            var name_list = std.array_list.Managed([]const u8).init(self.allocator);
+                            defer name_list.deinit();
+                            var it = self.name_set.?.iterator();
+                            while (it.next()) |entry| {
+                                try name_list.append(entry.key_ptr.*);
+                            }
+                            cfg.setDetectedNames(self.book_path, name_list.items) catch {};
+                        }
                     }
-                    cfg.setDetectedNames(self.book_path, name_list.items) catch {};
+                }
+                if (self.name_set != null) {
+                    self.name_highlight = true;
+                    self.saveProgress();
+                    try stdout().print("Name highlighting: \x1b[1;32mon\x1b[0m\n", .{});
+                    try self.showCurrentChapter();
                 }
             }
-            self.name_highlight = !self.name_highlight;
-            self.saveProgress();
-            const status = if (self.name_highlight) "\x1b[1;32mon\x1b[0m" else "\x1b[1;31moff\x1b[0m";
-            try stdout().print("Name highlighting: {s}\n", .{status});
-            if (self.name_highlight) try self.showCurrentChapter();
         } else if (std.mem.eql(u8, cmd, "info")) {
             try self.printWelcome();
         } else if (std.mem.eql(u8, cmd, "chapter") or std.mem.eql(u8, cmd, "ch")) {

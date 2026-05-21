@@ -520,7 +520,7 @@ const NAME_CLOSE_TAGS = [_][]const u8{
     "</name4>", "</name5>", "</name6>", "</name7>",
 };
 
-pub fn buildNameSet(allocator: std.mem.Allocator, epub: anytype) !NameSet {
+pub fn buildNameSetFromContents(allocator: std.mem.Allocator, contents: []const []const u8) !NameSet {
     var candidates = std.StringHashMap(usize).init(allocator);
     defer {
         var it = candidates.keyIterator();
@@ -535,11 +535,10 @@ pub fn buildNameSet(allocator: std.mem.Allocator, epub: anytype) !NameSet {
         char_freq.deinit();
     }
 
-    for (0..epub.chapters.items.len) |i| {
-        const content = try epub.getChapterContent(i);
-        if (content == null) continue;
-        try countCjkChars(allocator, content.?, &char_freq);
-        try collectCandidates(allocator, content.?, &candidates);
+    for (contents) |content| {
+        if (content.len == 0) continue;
+        try countCjkChars(allocator, content, &char_freq);
+        try collectCandidates(allocator, content, &candidates);
     }
 
     var result = NameSet.init(allocator);
@@ -608,6 +607,16 @@ pub fn buildNameSet(allocator: std.mem.Allocator, epub: anytype) !NameSet {
     }
 
     return result;
+}
+
+pub fn buildNameSet(allocator: std.mem.Allocator, epub: anytype) !NameSet {
+    var contents = std.array_list.Managed([]const u8).init(allocator);
+    defer contents.deinit();
+    for (0..epub.chapters.items.len) |i| {
+        const content = try epub.getChapterContent(i);
+        try contents.append(content orelse "");
+    }
+    return buildNameSetFromContents(allocator, contents.items);
 }
 
 pub fn deinitNameSet(set: *NameSet, allocator: std.mem.Allocator) void {
