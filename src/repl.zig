@@ -76,7 +76,11 @@ pub const Repl = struct {
         }
 
         try self.printWelcome();
-        try self.showToc();
+        if (try self.runTocSelector()) |idx| {
+            self.current_chapter = idx;
+            self.saveProgress();
+            try self.showCurrentChapter();
+        }
 
         var buf: [1024]u8 = undefined;
         while (self.running) {
@@ -134,6 +138,89 @@ pub const Repl = struct {
         }
         try stdout().print("\x1b[1;32m└───────────────────────────────────────┘\x1b[0m\n", .{});
         try stdout().print("\n", .{});
+    }
+
+    fn runTocSelector(self: *Repl) !?usize {
+        if (self.epub == null) return null;
+
+        const size = term.getTerminalSize() catch {
+            try self.showToc();
+            return null;
+        };
+
+        term.enableRawMode() catch {
+            try self.showToc();
+            return null;
+        };
+        defer term.disableRawMode();
+
+        const total = self.epub.?.chapters.items.len;
+        var selected: usize = self.current_chapter;
+        var top: usize = 0;
+
+        while (true) {
+            const header_rows: u16 = 1;
+            const footer_rows: u16 = 1;
+            const visible = if (size.rows > header_rows + footer_rows) size.rows - header_rows - footer_rows else 1;
+
+            // Keep selected item in view
+            if (selected < top) top = selected;
+            if (selected >= top + visible) top = selected - visible + 1;
+            if (top + visible > total) top = if (total > visible) total - visible else 0;
+
+            try stdout().writeAll("\x1b[2J\x1b[H");
+            try stdout().print("\x1b[1;32m┌────────── Table of Contents ({d}/{d}) ──────────┐\x1b[0m\n", .{ selected + 1, total });
+
+            const end = @min(top + visible, total);
+            for (self.epub.?.chapters.items[top..end], top..) |ch, i| {
+                const marker = if (i == selected) "\x1b[1;36m▶\x1b[0m" else " ";
+                const here = if (i == self.current_chapter) " \x1b[2m[here]\x1b[0m" else "";
+                try stdout().print("{s} \x1b[1m{d:3}\x1b[0m. {s}{s}\n", .{ marker, i + 1, ch.title, here });
+            }
+
+            try stdout().print("\x1b[7m[↑/↓/j/k] move  [Enter] select  [q] cancel\x1b[0m", .{});
+
+            const key = term.readKey() catch break;
+            switch (key) {
+                .char => |c| switch (c) {
+                    'q', 'Q' => {
+                        try stdout().writeAll("\n");
+                        return null;
+                    },
+                    'j', 'J' => {
+                        if (selected + 1 < total) selected += 1;
+                    },
+                    'k', 'K' => {
+                        if (selected > 0) selected -= 1;
+                    },
+                    'g' => selected = 0,
+                    'G' => {
+                        if (total > 0) selected = total - 1;
+                    },
+                    '\r' => {
+                        try stdout().writeAll("\n");
+                        return selected;
+                    },
+                    else => {},
+                },
+                .up => {
+                    if (selected > 0) selected -= 1;
+                },
+                .down => {
+                    if (selected + 1 < total) selected += 1;
+                },
+                .home => selected = 0,
+                .end => selected = total - 1,
+                .escape => {
+                    try stdout().writeAll("\n");
+                    return null;
+                },
+                else => {},
+            }
+        }
+
+        try stdout().writeAll("\n");
+        return null;
     }
 
     fn runPager(self: *Repl, text: []const u8) !void {
@@ -441,7 +528,11 @@ pub const Repl = struct {
         } else if (std.mem.eql(u8, cmd, "help") or std.mem.eql(u8, cmd, "h") or std.mem.eql(u8, cmd, "?")) {
             try self.showHelp();
         } else if (std.mem.eql(u8, cmd, "toc") or std.mem.eql(u8, cmd, "ls")) {
-            try self.showToc();
+            if (try self.runTocSelector()) |idx| {
+                self.current_chapter = idx;
+                self.saveProgress();
+                try self.showCurrentChapter();
+            }
         } else if (std.mem.eql(u8, cmd, "go") or std.mem.eql(u8, cmd, "cd") or std.mem.eql(u8, cmd, "goto")) {
             if (rest.len == 0) {
                 try stdout().print("\x1b[1;31mUsage: /go <chapter-number>\x1b[0m\n", .{});
