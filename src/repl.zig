@@ -3,6 +3,7 @@ const Epub = @import("epub.zig").Epub;
 const html = @import("html.zig");
 const names = @import("names.zig");
 const term = @import("term.zig");
+const Config = @import("config.zig").Config;
 
 pub const Repl = struct {
     allocator: std.mem.Allocator,
@@ -13,6 +14,8 @@ pub const Repl = struct {
     search_mode: SearchMode,
     name_highlight: bool,
     name_set: ?names.NameSet,
+    book_path: []const u8,
+    config: ?*Config,
 
     const SearchMode = enum {
         current_chapter,
@@ -29,6 +32,8 @@ pub const Repl = struct {
             .search_mode = .current_chapter,
             .name_highlight = false,
             .name_set = null,
+            .book_path = "",
+            .config = null,
         };
     }
 
@@ -43,9 +48,32 @@ pub const Repl = struct {
         return std.fs.File.stdout().deprecatedWriter();
     }
 
-    pub fn run(self: *Repl, epub: *Epub) !void {
+    pub fn run(self: *Repl, epub: *Epub, book_path: []const u8, config: ?*Config) !void {
         self.epub = epub;
-        self.current_chapter = 0;
+        self.book_path = book_path;
+        self.config = config;
+
+        // Restore saved progress
+        if (config) |cfg| {
+            if (cfg.getProgress(book_path)) |saved_chapter| {
+                if (saved_chapter < epub.chapters.items.len) {
+                    self.current_chapter = saved_chapter;
+                    try stdout().print("\x1b[1;33mResumed from chapter {d}\x1b[0m\n", .{saved_chapter + 1});
+                }
+            }
+            self.name_highlight = cfg.getNames(book_path);
+
+            // Restore detected names if available
+            if (self.name_highlight) {
+                if (cfg.loadNameSet(self.allocator, book_path)) |maybe_set| {
+                    if (maybe_set) |set| {
+                        self.name_set = set;
+                    }
+                } else |err| {
+                    try stdout().print("\x1b[1;33mNote: could not restore name set ({s}), will rebuild on demand.\x1b[0m\n", .{@errorName(err)});
+                }
+            }
+        }
 
         try self.printWelcome();
         try self.showToc();
@@ -251,6 +279,12 @@ pub const Repl = struct {
         try self.runPager(full_text);
     }
 
+    fn saveProgress(self: *Repl) void {
+        if (self.config) |cfg| {
+            cfg.setProgress(self.book_path, self.current_chapter, self.name_highlight) catch {};
+        }
+    }
+
     fn goToChapter(self: *Repl, num_str: []const u8) !void {
         const num = std.fmt.parseInt(usize, num_str, 10) catch {
             try stdout().print("\x1b[1;31mInvalid chapter number: {s}\x1b[0m\n", .{num_str});
@@ -266,6 +300,7 @@ pub const Repl = struct {
         }
 
         self.current_chapter = num - 1;
+        self.saveProgress();
         try self.showCurrentChapter();
     }
 
@@ -276,6 +311,7 @@ pub const Repl = struct {
             return;
         }
         self.current_chapter += 1;
+        self.saveProgress();
         try self.showCurrentChapter();
     }
 
@@ -285,6 +321,7 @@ pub const Repl = struct {
             return;
         }
         self.current_chapter -= 1;
+        self.saveProgress();
         try self.showCurrentChapter();
     }
 
@@ -398,6 +435,7 @@ pub const Repl = struct {
         const rest = std.mem.trim(u8, body[cmd.len..], " \t\r\n");
 
         if (std.mem.eql(u8, cmd, "quit") or std.mem.eql(u8, cmd, "q") or std.mem.eql(u8, cmd, "exit")) {
+            self.saveProgress();
             self.running = false;
             try stdout().print("\x1b[1;33mGoodbye! 👋\x1b[0m\n", .{});
         } else if (std.mem.eql(u8, cmd, "help") or std.mem.eql(u8, cmd, "h") or std.mem.eql(u8, cmd, "?")) {
@@ -429,8 +467,20 @@ pub const Repl = struct {
                 try stdout().print("\x1b[2mScanning book for recurring names...\x1b[0m\n", .{});
                 self.name_set = try names.buildNameSet(self.allocator, self.epub.?);
                 try stdout().print("\x1b[2mDone.\x1b[0m\n", .{});
+
+                // Save detected names to config
+                if (self.config) |cfg| {
+                    var name_list = std.array_list.Managed([]const u8).init(self.allocator);
+                    defer name_list.deinit();
+                    var it = self.name_set.?.iterator();
+                    while (it.next()) |entry| {
+                        try name_list.append(entry.key_ptr.*);
+                    }
+                    cfg.setDetectedNames(self.book_path, name_list.items) catch {};
+                }
             }
             self.name_highlight = !self.name_highlight;
+            self.saveProgress();
             const status = if (self.name_highlight) "\x1b[1;32mon\x1b[0m" else "\x1b[1;31moff\x1b[0m";
             try stdout().print("Name highlighting: {s}\n", .{status});
             if (self.name_highlight) try self.showCurrentChapter();

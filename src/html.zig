@@ -29,7 +29,16 @@ const ANSI_BG_BLUE = "\x1b[44m";
 const ANSI_BG_MAGENTA = "\x1b[45m";
 const ANSI_BG_CYAN = "\x1b[46m";
 const ANSI_BG_WHITE = "\x1b[47m";
-const ANSI_NAME = ANSI_BOLD ++ ANSI_MAGENTA;
+const NAME_COLORS = [_][]const u8{
+    ANSI_BOLD ++ ANSI_RED,      // name0
+    ANSI_BOLD ++ ANSI_GREEN,    // name1
+    ANSI_BOLD ++ ANSI_YELLOW,   // name2
+    ANSI_BOLD ++ ANSI_BLUE,     // name3
+    ANSI_BOLD ++ ANSI_MAGENTA,  // name4
+    ANSI_BOLD ++ ANSI_CYAN,     // name5
+    ANSI_BOLD ++ ANSI_WHITE,    // name6
+    ANSI_BOLD ++ ANSI_RED,      // name7 — distinct via bold+red with potential terminal bright mapping
+};
 
 const TagStyle = struct {
     open: []const u8,
@@ -61,7 +70,12 @@ fn getTagStyle(tag: []const u8) ?TagStyle {
 
     // Highlight search matches - special handling
     if (std.mem.eql(u8, t, "search-match")) return .{ .open = ANSI_BG_YELLOW ++ ANSI_BLACK ++ ANSI_BOLD };
-    if (std.mem.eql(u8, t, "name")) return .{ .open = ANSI_NAME };
+
+    if (std.mem.startsWith(u8, t, "name")) {
+        const rest = std.mem.trim(u8, t[4..], " \t\r\n");
+        const num = std.fmt.parseInt(usize, rest, 10) catch return null;
+        if (num < NAME_COLORS.len) return .{ .open = NAME_COLORS[num] };
+    }
 
     return null;
 }

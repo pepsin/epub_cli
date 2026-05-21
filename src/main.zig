@@ -1,6 +1,7 @@
 const std = @import("std");
 const Epub = @import("epub.zig").Epub;
 const Repl = @import("repl.zig").Repl;
+const Config = @import("config.zig").Config;
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -31,6 +32,26 @@ pub fn main() !void {
         std.process.exit(1);
     };
 
+    // Resolve absolute path for stable config keys
+    const file_path_abs = std.fs.cwd().realpathAlloc(allocator, file_path) catch |err| blk: {
+        const stderr = std.fs.File.stderr().deprecatedWriter();
+        try stderr.print("\x1b[1;33mWarning: could not resolve full path ({s}), using '{s}'\x1b[0m\n", .{ @errorName(err), file_path });
+        break :blk try allocator.dupe(u8, file_path);
+    };
+    defer allocator.free(file_path_abs);
+
+    // Load config
+    var config_loaded = false;
+    var config: Config = undefined;
+    if (Config.init(allocator)) |cfg| {
+        config = cfg;
+        config_loaded = true;
+    } else |err| {
+        const stderr = std.fs.File.stderr().deprecatedWriter();
+        try stderr.print("\x1b[1;33mWarning: config unavailable ({s})\x1b[0m\n", .{@errorName(err)});
+    }
+    defer if (config_loaded) config.deinit();
+
     const stdout = std.fs.File.stdout().deprecatedWriter();
     try stdout.print("\x1b[2mLoading {s}...\x1b[0m\n", .{file_path});
 
@@ -46,5 +67,6 @@ pub fn main() !void {
     var repl = Repl.init(allocator);
     defer repl.deinit();
 
-    try repl.run(&epub);
+    const config_ptr: ?*Config = if (config_loaded) &config else null;
+    try repl.run(&epub, file_path_abs, config_ptr);
 }

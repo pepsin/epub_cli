@@ -509,7 +509,16 @@ fn minCharFreq(name: []const u8, char_freq: *std.StringHashMap(usize)) ?usize {
     return min_freq;
 }
 
-pub const NameSet = std.StringHashMap(void);
+pub const NameSet = std.StringHashMap(usize);
+
+const NAME_OPEN_TAGS = [_][]const u8{
+    "<name0>", "<name1>", "<name2>", "<name3>",
+    "<name4>", "<name5>", "<name6>", "<name7>",
+};
+const NAME_CLOSE_TAGS = [_][]const u8{
+    "</name0>", "</name1>", "</name2>", "</name3>",
+    "</name4>", "</name5>", "</name6>", "</name7>",
+};
 
 pub fn buildNameSet(allocator: std.mem.Allocator, epub: anytype) !NameSet {
     var candidates = std.StringHashMap(usize).init(allocator);
@@ -554,7 +563,7 @@ pub fn buildNameSet(allocator: std.mem.Allocator, epub: anytype) !NameSet {
         if (jaccard < jaccard_threshold) continue;
 
         const key = try allocator.dupe(u8, name);
-        try result.put(key, {});
+        try result.put(key, 0);
     }
 
     // Pass 2: 3-char names (min-character ratio filter)
@@ -569,7 +578,7 @@ pub fn buildNameSet(allocator: std.mem.Allocator, epub: anytype) !NameSet {
         if (char_ratio < char_ratio_threshold_3) continue;
 
         const key = try allocator.dupe(u8, name);
-        try result.put(key, {});
+        try result.put(key, 0);
     }
 
     // Pass 3: 4-char names (must have accepted 3-char prefix + min-character ratio)
@@ -587,7 +596,15 @@ pub fn buildNameSet(allocator: std.mem.Allocator, epub: anytype) !NameSet {
         if (char_ratio < char_ratio_threshold_4) continue;
 
         const key = try allocator.dupe(u8, name);
-        try result.put(key, {});
+        try result.put(key, 0);
+    }
+
+    // Assign colors (0-7) to each detected name
+    var color_idx: usize = 0;
+    var color_it = result.iterator();
+    while (color_it.next()) |entry| {
+        entry.value_ptr.* = color_idx % 8;
+        color_idx += 1;
     }
 
     return result;
@@ -621,28 +638,30 @@ pub fn injectNameTags(allocator: std.mem.Allocator, html: []const u8, name_set: 
             while (j < text.len) {
                 if (name_set) |set| {
                     // Check if any known name starts at this position (prefer longest)
-                    var longest_match: ?usize = null;
-                    var it = set.keyIterator();
-                    while (it.next()) |key| {
-                        const name = key.*;
+                    var longest_match_len: ?usize = null;
+                    var longest_match_color: usize = 0;
+                    var it = set.iterator();
+                    while (it.next()) |entry| {
+                        const name = entry.key_ptr.*;
                         if (std.mem.startsWith(u8, text[j..], name)) {
-                            if (longest_match == null or name.len > longest_match.?) {
-                                longest_match = name.len;
+                            if (longest_match_len == null or name.len > longest_match_len.?) {
+                                longest_match_len = name.len;
+                                longest_match_color = entry.value_ptr.*;
                             }
                         }
                     }
-                    if (longest_match) |name_len| {
-                        try marked.appendSlice("<name>");
+                    if (longest_match_len) |name_len| {
+                        try marked.appendSlice(NAME_OPEN_TAGS[longest_match_color]);
                         try marked.appendSlice(text[j .. j + name_len]);
-                        try marked.appendSlice("</name>");
+                        try marked.appendSlice(NAME_CLOSE_TAGS[longest_match_color]);
                         j += name_len;
                         continue;
                     }
                 } else {
                     if (tryMatchChineseNameLoose(text, j)) |name_len| {
-                        try marked.appendSlice("<name>");
+                        try marked.appendSlice(NAME_OPEN_TAGS[0]);
                         try marked.appendSlice(text[j .. j + name_len]);
-                        try marked.appendSlice("</name>");
+                        try marked.appendSlice(NAME_CLOSE_TAGS[0]);
                         j += name_len;
                         continue;
                     }
