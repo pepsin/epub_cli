@@ -382,6 +382,73 @@ pub const Repl = struct {
         return width;
     }
 
+    fn linePhysicalRows(line: []const u8, cols: usize) usize {
+        const w = lineDisplayWidth(line);
+        return if (w == 0) 1 else (w + cols - 1) / cols;
+    }
+
+    fn printLineFromRow(writer: anytype, line: []const u8, start_row: usize, cols: usize) !void {
+        if (start_row == 0) {
+            try writer.print("{s}\n", .{line});
+            return;
+        }
+
+        const skip_width = start_row * cols;
+        var width: usize = 0;
+        var i: usize = 0;
+
+        while (i < line.len and width < skip_width) {
+            if (line[i] == '\x1b' and i + 1 < line.len and line[i + 1] == '[') {
+                try writer.writeAll("\x1b[");
+                i += 2;
+                while (i < line.len and ((line[i] >= '0' and line[i] <= '9') or line[i] == ';' or line[i] == '?')) {
+                    try writer.writeByte(line[i]);
+                    i += 1;
+                }
+                if (i < line.len) {
+                    try writer.writeByte(line[i]);
+                    i += 1;
+                }
+                continue;
+            }
+
+            const len = std.unicode.utf8ByteSequenceLength(line[i]) catch {
+                width += 1;
+                i += 1;
+                continue;
+            };
+            if (i + len > line.len) {
+                width += 1;
+                i += 1;
+                continue;
+            }
+            const cp = std.unicode.utf8Decode(line[i..][0..len]) catch {
+                width += 1;
+                i += 1;
+                continue;
+            };
+            const is_wide = (cp >= 0x4E00 and cp <= 0x9FFF) or
+                            (cp >= 0x3400 and cp <= 0x4DBF) or
+                            (cp >= 0x3000 and cp <= 0x303F) or
+                            (cp >= 0xFF01 and cp <= 0xFF60) or
+                            (cp >= 0xFFE0 and cp <= 0xFFE6);
+            const char_width: usize = if (is_wide) 2 else 1;
+
+            if (width + char_width > skip_width) {
+                try writer.writeAll(line[i..][0..len]);
+                width += char_width;
+                i += len;
+                break;
+            }
+
+            width += char_width;
+            i += len;
+        }
+
+        try writer.writeAll(line[i..]);
+        try writer.writeByte('\n');
+    }
+
     fn runPager(self: *Repl, text: []const u8) !PagerAction {
         const size = term.getTerminalSize() catch {
             try stdout().print("{s}\n", .{text});
@@ -403,7 +470,8 @@ pub const Repl = struct {
         };
         defer term.disableRawMode();
 
-        var top: usize = 0;
+        var top_line: usize = 0;
+        var top_row: usize = 0;
 
         while (true) {
             const current_size = term.getTerminalSize() catch size;
@@ -413,16 +481,27 @@ pub const Repl = struct {
             try stdout().writeAll("\x1b[2J\x1b[H");
 
             var phys_rows: usize = 0;
-            for (lines.items[top..]) |line| {
-                const w = lineDisplayWidth(line);
-                const line_rows = if (w == 0) 1 else (w + cols - 1) / cols;
-                if (phys_rows + line_rows > visible_lines) break;
-                try stdout().print("{s}\n", .{line});
-                phys_rows += line_rows;
+            var i: usize = top_line;
+            while (i < lines.items.len) : (i += 1) {
+                const line = lines.items[i];
+                const line_rows = linePhysicalRows(line, cols);
+                const start_row = if (i == top_line) top_row else 0;
+                const visible_rows = if (line_rows > start_row) line_rows - start_row else 0;
+                if (phys_rows + visible_rows > visible_lines) break;
+                if (visible_rows > 0) {
+                    if (start_row == 0) {
+                        try stdout().print("{s}\n", .{line});
+                    } else {
+                        try printLineFromRow(stdout(), line, start_row, cols);
+                    }
+                }
+                phys_rows += visible_rows;
             }
 
-            try stdout().print("\x1b[7m-- {d}/{d} -- [j/k/↵/n/p/u/d/g/G/q] --\x1b[0m", .{
-                top + 1,
+            const status_row = visible_lines + 1;
+            try stdout().print("\x1b[{d};1H\x1b[7m-- {d}/{d} -- [j/k/↵/n/p/u/d/g/G/q] --\x1b[0m", .{
+                status_row,
+                top_line + 1,
                 lines.items.len,
             });
 
@@ -434,44 +513,150 @@ pub const Repl = struct {
                     'p', 'P' => return .prev_chapter,
                     '\r', '\n' => return .next_chapter,
                     'j', 'J', ' ' => {
-                        if (top + 1 < lines.items.len) top += 1;
+                        const line_rows = linePhysicalRows(lines.items[top_line], cols);
+                        if (top_row + 1 < line_rows) {
+                            top_row += 1;
+                        } else if (top_line + 1 < lines.items.len) {
+                            top_line += 1;
+                            top_row = 0;
+                        }
                     },
                     'k', 'K' => {
-                        if (top > 0) top -= 1;
+                        if (top_row > 0) {
+                            top_row -= 1;
+                        } else if (top_line > 0) {
+                            top_line -= 1;
+                            top_row = linePhysicalRows(lines.items[top_line], cols);
+                            if (top_row > 0) top_row -= 1;
+                        }
                     },
                     'd', 'D' => {
-                        const half = visible_lines / 2;
-                        const new_top = top + half;
-                        top = if (new_top >= lines.items.len) lines.items.len - 1 else new_top;
+                        var remaining: usize = visible_lines / 2;
+                        if (remaining == 0) remaining = 1;
+                        while (remaining > 0) {
+                            const line_rows = linePhysicalRows(lines.items[top_line], cols);
+                            const avail = line_rows - top_row;
+                            if (remaining < avail) {
+                                top_row += remaining;
+                                break;
+                            }
+                            remaining -= avail;
+                            top_line += 1;
+                            top_row = 0;
+                            if (top_line >= lines.items.len) {
+                                top_line = lines.items.len - 1;
+                                top_row = 0;
+                                break;
+                            }
+                        }
                     },
                     'u', 'U' => {
-                        const half = visible_lines / 2;
-                        top = if (top > half) top - half else 0;
+                        var remaining: usize = visible_lines / 2;
+                        if (remaining == 0) remaining = 1;
+                        while (remaining > 0) {
+                            if (top_row > 0) {
+                                const back = @min(top_row, remaining);
+                                top_row -= back;
+                                remaining -= back;
+                                if (remaining == 0) break;
+                            }
+                            if (top_line == 0) break;
+                            top_line -= 1;
+                            top_row = linePhysicalRows(lines.items[top_line], cols);
+                        }
                     },
-                    'g' => top = 0,
+                    'g' => {
+                        top_line = 0;
+                        top_row = 0;
+                    },
                     'G' => {
-                        top = if (lines.items.len > visible_lines) lines.items.len - visible_lines else 0;
+                        var rows: usize = 0;
+                        top_line = lines.items.len;
+                        top_row = 0;
+                        while (top_line > 0) {
+                            const prev_rows = linePhysicalRows(lines.items[top_line - 1], cols);
+                            if (rows + prev_rows > visible_lines) {
+                                top_row = prev_rows - (visible_lines - rows);
+                                break;
+                            }
+                            rows += prev_rows;
+                            top_line -= 1;
+                        }
+                        if (top_line == 0) top_row = 0;
                     },
                     else => {},
                 },
                 .up => {
-                    if (top > 0) top -= 1;
+                    if (top_row > 0) {
+                        top_row -= 1;
+                    } else if (top_line > 0) {
+                        top_line -= 1;
+                        top_row = linePhysicalRows(lines.items[top_line], cols);
+                        if (top_row > 0) top_row -= 1;
+                    }
                 },
                 .down => {
-                    if (top + 1 < lines.items.len) top += 1;
+                    const line_rows = linePhysicalRows(lines.items[top_line], cols);
+                    if (top_row + 1 < line_rows) {
+                        top_row += 1;
+                    } else if (top_line + 1 < lines.items.len) {
+                        top_line += 1;
+                        top_row = 0;
+                    }
                 },
                 .page_up => {
-                    const half = visible_lines / 2;
-                    top = if (top > half) top - half else 0;
+                    var remaining: usize = visible_lines / 2;
+                    if (remaining == 0) remaining = 1;
+                    while (remaining > 0) {
+                        if (top_row > 0) {
+                            const back = @min(top_row, remaining);
+                            top_row -= back;
+                            remaining -= back;
+                            if (remaining == 0) break;
+                        }
+                        if (top_line == 0) break;
+                        top_line -= 1;
+                        top_row = linePhysicalRows(lines.items[top_line], cols);
+                    }
                 },
                 .page_down => {
-                    const half = visible_lines / 2;
-                    const new_top = top + half;
-                    top = if (new_top >= lines.items.len) lines.items.len - 1 else new_top;
+                    var remaining: usize = visible_lines / 2;
+                    if (remaining == 0) remaining = 1;
+                    while (remaining > 0) {
+                        const line_rows = linePhysicalRows(lines.items[top_line], cols);
+                        const avail = line_rows - top_row;
+                        if (remaining < avail) {
+                            top_row += remaining;
+                            break;
+                        }
+                        remaining -= avail;
+                        top_line += 1;
+                        top_row = 0;
+                        if (top_line >= lines.items.len) {
+                            top_line = lines.items.len - 1;
+                            top_row = 0;
+                            break;
+                        }
+                    }
                 },
-                .home => top = 0,
+                .home => {
+                    top_line = 0;
+                    top_row = 0;
+                },
                 .end => {
-                    top = if (lines.items.len > visible_lines) lines.items.len - visible_lines else 0;
+                    var rows: usize = 0;
+                    top_line = lines.items.len;
+                    top_row = 0;
+                    while (top_line > 0) {
+                        const prev_rows = linePhysicalRows(lines.items[top_line - 1], cols);
+                        if (rows + prev_rows > visible_lines) {
+                            top_row = prev_rows - (visible_lines - rows);
+                            break;
+                        }
+                        rows += prev_rows;
+                        top_line -= 1;
+                    }
+                    if (top_line == 0) top_row = 0;
                 },
                 .escape => return .quit,
                 else => {},
