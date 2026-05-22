@@ -375,7 +375,28 @@ pub const Repl = struct {
                             (cp >= 0x3400 and cp <= 0x4DBF) or
                             (cp >= 0x3000 and cp <= 0x303F) or
                             (cp >= 0xFF01 and cp <= 0xFF60) or
-                            (cp >= 0xFFE0 and cp <= 0xFFE6);
+                            (cp >= 0xFFE0 and cp <= 0xFFE6) or
+                            // East Asian Ambiguous / Wide punctuation commonly used in CJK text
+                            (cp >= 0x2013 and cp <= 0x2046) or  // dashes, quotes, ellipsis, etc.
+                            (cp >= 0x20A0 and cp <= 0x20CF) or  // currency symbols
+                            (cp >= 0x2100 and cp <= 0x214F) or  // letterlike symbols
+                            (cp >= 0x2190 and cp <= 0x21FF) or  // arrows
+                            (cp >= 0x2200 and cp <= 0x22FF) or  // mathematical operators
+                            (cp >= 0x2460 and cp <= 0x24FF) or  // enclosed alphanumerics
+                            (cp >= 0x25A0 and cp <= 0x25FF) or  // geometric shapes
+                            (cp >= 0x2600 and cp <= 0x26FF) or  // miscellaneous symbols
+                            (cp >= 0x2E80 and cp <= 0x2EFF) or  // CJK radicals supplement
+                            (cp >= 0x2F00 and cp <= 0x2FDF) or  // Kangxi radicals
+                            (cp >= 0x2FF0 and cp <= 0x2FFF) or  // ideographic description characters
+                            (cp >= 0x3040 and cp <= 0x309F) or  // Hiragana
+                            (cp >= 0x30A0 and cp <= 0x30FF) or  // Katakana
+                            (cp >= 0x3100 and cp <= 0x312F) or  // Bopomofo
+                            (cp >= 0x31C0 and cp <= 0x31EF) or  // CJK strokes
+                            (cp >= 0x3200 and cp <= 0x32FF) or  // enclosed CJK letters and months
+                            (cp >= 0x3300 and cp <= 0x33FF) or  // CJK compatibility
+                            (cp >= 0x4DC0 and cp <= 0x4DFF) or  // Yijing hexagram symbols
+                            (cp >= 0xF900 and cp <= 0xFAFF) or  // CJK compatibility ideographs
+                            (cp >= 0xFE30 and cp <= 0xFE4F);    // CJK compatibility forms
             width += if (is_wide) 2 else 1;
             i += len;
         }
@@ -431,7 +452,28 @@ pub const Repl = struct {
                             (cp >= 0x3400 and cp <= 0x4DBF) or
                             (cp >= 0x3000 and cp <= 0x303F) or
                             (cp >= 0xFF01 and cp <= 0xFF60) or
-                            (cp >= 0xFFE0 and cp <= 0xFFE6);
+                            (cp >= 0xFFE0 and cp <= 0xFFE6) or
+                            // East Asian Ambiguous / Wide punctuation commonly used in CJK text
+                            (cp >= 0x2013 and cp <= 0x2046) or  // dashes, quotes, ellipsis, etc.
+                            (cp >= 0x20A0 and cp <= 0x20CF) or  // currency symbols
+                            (cp >= 0x2100 and cp <= 0x214F) or  // letterlike symbols
+                            (cp >= 0x2190 and cp <= 0x21FF) or  // arrows
+                            (cp >= 0x2200 and cp <= 0x22FF) or  // mathematical operators
+                            (cp >= 0x2460 and cp <= 0x24FF) or  // enclosed alphanumerics
+                            (cp >= 0x25A0 and cp <= 0x25FF) or  // geometric shapes
+                            (cp >= 0x2600 and cp <= 0x26FF) or  // miscellaneous symbols
+                            (cp >= 0x2E80 and cp <= 0x2EFF) or  // CJK radicals supplement
+                            (cp >= 0x2F00 and cp <= 0x2FDF) or  // Kangxi radicals
+                            (cp >= 0x2FF0 and cp <= 0x2FFF) or  // ideographic description characters
+                            (cp >= 0x3040 and cp <= 0x309F) or  // Hiragana
+                            (cp >= 0x30A0 and cp <= 0x30FF) or  // Katakana
+                            (cp >= 0x3100 and cp <= 0x312F) or  // Bopomofo
+                            (cp >= 0x31C0 and cp <= 0x31EF) or  // CJK strokes
+                            (cp >= 0x3200 and cp <= 0x32FF) or  // enclosed CJK letters and months
+                            (cp >= 0x3300 and cp <= 0x33FF) or  // CJK compatibility
+                            (cp >= 0x4DC0 and cp <= 0x4DFF) or  // Yijing hexagram symbols
+                            (cp >= 0xF900 and cp <= 0xFAFF) or  // CJK compatibility ideographs
+                            (cp >= 0xFE30 and cp <= 0xFE4F);    // CJK compatibility forms
             const char_width: usize = if (is_wide) 2 else 1;
 
             if (width + char_width > skip_width) {
@@ -512,13 +554,34 @@ pub const Repl = struct {
                     'n', 'N' => return .next_chapter,
                     'p', 'P' => return .prev_chapter,
                     '\r', '\n' => return .next_chapter,
-                    'j', 'J', ' ' => {
+                    'j', 'J' => {
                         const line_rows = linePhysicalRows(lines.items[top_line], cols);
                         if (top_row + 1 < line_rows) {
                             top_row += 1;
                         } else if (top_line + 1 < lines.items.len) {
                             top_line += 1;
                             top_row = 0;
+                        }
+                    },
+                    ' ' => {
+                        // Scroll down one full page
+                        var remaining: usize = visible_lines;
+                        if (remaining == 0) remaining = 1;
+                        while (remaining > 0) {
+                            const line_rows = linePhysicalRows(lines.items[top_line], cols);
+                            const avail = line_rows - top_row;
+                            if (remaining < avail) {
+                                top_row += remaining;
+                                break;
+                            }
+                            remaining -= avail;
+                            top_line += 1;
+                            top_row = 0;
+                            if (top_line >= lines.items.len) {
+                                top_line = lines.items.len - 1;
+                                top_row = 0;
+                                break;
+                            }
                         }
                     },
                     'k', 'K' => {
@@ -563,6 +626,7 @@ pub const Repl = struct {
                             if (top_line == 0) break;
                             top_line -= 1;
                             top_row = linePhysicalRows(lines.items[top_line], cols);
+                            if (top_row > 0) top_row -= 1;
                         }
                     },
                     'g' => {
@@ -617,6 +681,7 @@ pub const Repl = struct {
                         if (top_line == 0) break;
                         top_line -= 1;
                         top_row = linePhysicalRows(lines.items[top_line], cols);
+                        if (top_row > 0) top_row -= 1;
                     }
                 },
                 .page_down => {
