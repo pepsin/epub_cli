@@ -3,6 +3,11 @@
 zig-out/
 build/
 
+# Node.js build artifacts
+node_modules/
+dist/
+*.log
+
 # Epub files
 *.epub
 
@@ -16,3 +21,5 @@ Thumbs.db
 *~
 .idea/
 .vscode/
+test_fifo
+test_ink.mjs
